@@ -1,5 +1,5 @@
 ---
-title: "M502B Housing Project"
+title: "Housing Project"
 author: "Jose Aguilar"
 date: "11/21/2021"
 output: html_document
