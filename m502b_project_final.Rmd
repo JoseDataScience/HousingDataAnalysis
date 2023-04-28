@@ -1,0 +1,942 @@
+---
+title: "M502B Housing Project"
+author: "Jose Aguilar"
+date: "11/21/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+## Background Information
+The data being analyzed comes from the Kaggle House Prices competition, and is composed of a 1460 rows and 81 columns. Of the 81 columns, one column is simply an id column to be ignored, 79 of the columns are explanatory variables, and the SalePrice column is the response variable we will try to predict. The data all comes from Ames, Iowa and thus our results may not necessarily be generalizable to other locations as the value of certain features may not be equivalent elsewhere.
+
+
+```{r Reading In Data}
+library(speedglm) #Needed to do linear regression quickly
+library(glmnet)
+library(tidyverse)
+library(caret)
+library(ggcorrplot)
+library(randomForest)
+library(coefplot)
+library(gglasso) 
+library(matrixStats)
+
+
+Housing = read.csv("train.csv");
+Test_Housing = read.csv("test.csv");
+Test_Housing = Test_Housing[,-1];
+Fixed_Housing = Housing[,-1];
+```
+
+
+```{r Custom Functions}
+
+Mode = function(x) {
+  ux = unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+RMSLE = function(pred, obs){
+  return (sqrt(mean((log(pred) - log(obs)) ^2)))
+}
+
+makeHist = function(g, title, error = NULL, xmax = 800000, ymax = 600){
+  h =hist(g, breaks = 20, density = 20,
+          col = "darkgrey", xlab = "Sale Prices", main = title, xlim = c(0,xmax), ylim = c(0,ymax))
+  xfit <- seq(min(g), max(g), length = 40) 
+  yfit <- dlnorm(xfit, meanlog = mean(log(g)), sdlog = sd(log(g))) 
+  yfit <- yfit * diff(h$mids[1:2]) * length(g) 
+  lines(xfit, yfit, col = "black", lwd = 2)
+  if(!(is.null(error)))
+    text(x = xmax - 200000, y = ymax - 200, labels = paste("RMSLE: ", as.character(error)))
+}
+
+
+makeLogHist = function(g, title, error = NULL){
+  g = log(g)
+  h =hist(g, breaks = 20, density = 20,
+          col = "darkgrey", xlab = "Sale Prices", main = title, xlim = c(10,14), ylim = c(0,500))
+  xfit <- seq(min(g), max(g), length = 40) 
+  yfit <- dnorm(xfit, mean = mean(g), sd = sd(g)) 
+  yfit <- yfit * diff(h$mids[1:2]) * length(g) 
+  lines(xfit, yfit, col = "black", lwd = 2)
+  if(!(is.null(error)))
+    text(x = 13.5, y = 350, labels = paste("RMSLE: ", as.character(error)))
+  text(x = 13.5, y = 325, labels = paste("Mean: ", as.character(round(mean(g),3))))
+  text(x = 13.5, y = 300, labels = paste("Std: ", as.character(round(sd(g),3))))
+}
+
+
+
+printNa = function(df, col){
+  return(df[which(is.na(df[,col])) , col])
+}
+
+
+
+
+corrAbove = function(corrMat, corVal){
+  temp = as.data.frame(which(corrMat >= corVal, arr.ind = T)) #Finding the numeric variables that have an absolute correlation greater than 0.8
+  temp = temp[which(temp$row < temp$col),] #Ignoring when the variables are the same
+  rownames(temp) = 1:length(temp[,1])
+  
+  Correlation = rep(NA, length(temp[,1]))
+  
+  for (i in 1:length(temp[,1])){
+    Correlation[i] = corrMat[temp[i,1], temp[i,2]]
+  }
+  
+  temp = cbind(temp, Correlation)
+  
+  return(temp)
+}
+
+pickDroppedCorr = function(corrMat, row){
+  name1 = row[1]
+  name2 = row[2]
+  if(name1 =="SalePrice" | name2 == "SalePrice")
+    return(NA)
+  
+  corr1 = corrMat["SalePrice", name1]
+  corr2 = corrMat["SalePrice", name2]
+  if(corr1 > corr2)
+    return(name2)
+  else if(corr1 < corr2)
+    return(name1)
+  else{
+    corr1.sum = sum(corrMat[name1,])
+    corr2.sum = sum(corrMat[name2,])
+    if(corr1.sum > corr2.sum)
+      return(name1)
+    else
+      return(name2)
+  }
+  
+}
+```
+
+
+## Data Exploration
+Of the 81 columns, there are 19 columns with NA values that need to be fixed first. Looking at the data description text file included along with the csv's on Kaggle, we can see that only 14 of the columns are supposed to have NA as a factor. The five that are not supposed to have NA's are LotFrontage, MasVnrType, MasVnrArea, Electrical, and GarageYrBlt. 
+
+There are 259 NA's in LotFrontage which is almost 20% of the data, so we need to fill the NA's as accurately as possible. Instead of simply setting the NA's to be the mean or median, we look at several possibly related variables and after some trial and error, we create a linear model. Plotting LotArea vs LotFrontage reveals that the relationship is not quite linear. After some more trial and error, we get that the logarithm of LotArea gives the best results. We used 10-Fold Cross Validation to test our results since the number of variables used in testing each model was different. 
+
+MasVnrType is supposed to have "None" instead of NA, however there are 8 NA's in that column. Similarly, MasVnrArea is not supposed to have NA's but has 8 in the same rows as MasVnrType so it's likely that there is either missing information such as another MasVnrType but since MasVnrArea is also NA, it's likely that the data is just meant to be "None" and zeros. Furthermore, since it's only 8 out of 1460 observations, it's unlikely to have too large of an effect so we safely set the data to be "None" and zero to remove the NA's.
+
+Electrical only has one NA entry so we simply set it equal to the mode of Fixed_Housing$Electrical.
+
+GarageYrBlt has NA's corresponding to the houses without garages, so we need a numeric value to put as a placeholder. We will simply use the median to avoid adding unnecessary noise to the column that might throw off the results. We use the median since all the years are integers so we would like to avoid adding unnecessary fractions. We also introduce a new column that corresponds to whether a Garage exists or not to, hopefully, help the models account for the missing garages in GarageYrBlt.
+
+Looking at the data before the NA's are remedied, we can plot the Sale Price versus different predictors to see that a lot of the predictors suffer from heteroscedasticity, and applying a log transformation to the response variable seems to fix the issue. As we will see later on, this does indeed cause a significant increase in our prediction accuracy.
+
+Plotting out predictors by themselves, we can identify certain predictors that have outliers that could cause problems in our models. Furthermore, we're able to identify predictors that don't have much variation such as the street predictor which has 6 observations for Grvl and 1454 observations in Pave. Instead of removing these problematic variables right away, we instead leave them in so we can compare the difference they make.
+
+Next, we look at the Test Data to see if there's any problems with it. 
+ 
+
+```{r Initial Data Exploration}
+
+str(Fixed_Housing) #Looking at what data type each column is. They are all the correct data type except for the chr's which should be factors.
+
+Fixed_Housing = as.data.frame(unclass(Fixed_Housing), stringsAsFactors = TRUE)
+
+num_cols = which(unlist(lapply(Fixed_Housing, is.numeric))) #Seeing which columns are numeric/non-factors
+num_cols.names = colnames(Fixed_Housing)[num_cols]
+
+not_num_cols = colnames(Fixed_Housing)[-num_cols]
+
+for (i in num_cols.names){
+  hist(Fixed_Housing[!is.na(Fixed_Housing[,i]),i], xlab = i, main = i)
+}
+
+for (i in colnames(Fixed_Housing)){
+  plot(Fixed_Housing[!is.na(Fixed_Housing[,i]),i], xlab = i, main = i)
+}
+
+for(i in num_cols){
+  plot(Fixed_Housing[!is.na(Fixed_Housing[,i]),i], Fixed_Housing$SalePrice[!is.na(Fixed_Housing[,i])], xlab = colnames(Fixed_Housing)[i], ylab = "SalePrice") #Heteroscedasticity is present so we should use the log(SalePrice) and see if it fixes it
+}
+
+for(i in num_cols){
+  plot(Fixed_Housing[!is.na(Fixed_Housing[,i]),i], log(Fixed_Housing$SalePrice[!is.na(Fixed_Housing[,i])]), xlab = colnames(Fixed_Housing)[i], ylab = "Log(SalePrice)") #Heteroscedasticity is reduced.
+}
+
+cor(Fixed_Housing$YearRemodAdd, Fixed_Housing$SalePrice)
+cor(Fixed_Housing$YearRemodAdd, log(Fixed_Housing$SalePrice))
+
+cor(Fixed_Housing$GarageYrBlt[!is.na(Fixed_Housing$GarageYrBlt)], Fixed_Housing$SalePrice[!is.na(Fixed_Housing$GarageYrBlt)])
+
+cor(Fixed_Housing$GarageYrBlt[!is.na(Fixed_Housing$GarageYrBlt)], log(Fixed_Housing$SalePrice[!is.na(Fixed_Housing$GarageYrBlt)]))
+
+```
+
+```{r Looking at Test data}
+for(i in num_cols[-length(num_cols)]){
+    hist(Test_Housing[!is.na(Test_Housing[,i]),i], xlab = colnames(Fixed_Housing)[i], main = colnames(Test_Housing)[i])
+} 
+
+
+
+#The GarageYrBlt for House 1133 was built in the 2207 so I need to fix the number. The house was built in 2006 and remodeled in 2007. So it's likely that the correct year was 2207.
+Test_Housing$GarageYrBlt[1133] = 2007
+
+```
+
+```{r Looking at what NAs need to be fixed}
+hasNa = apply(apply(Housing, 2, is.na), 2, any); #First apply checks each entry for NA, then the next apply checks if the column has any True values. 
+
+hasNa.index = which(hasNa %in% TRUE); #Creating a list that contains the indices of the columns with NA's
+
+hasNa.names = names(Housing[hasNa.index]); #Getting the names of the columns with NA entries.
+
+hasNa.columns = Housing[,hasNa.index]; #Getting just the columns with na values
+hasNa.colSums = as.data.frame(t(colSums(is.na(Housing[hasNa.index])))); #Looking at how many na's are present in each of the na filled columns.
+
+par(mar=c(7, 4.1, 4.1, 2.1))
+barplot(as.matrix(hasNa.colSums), las = 2)
+```
+
+
+```{r Fixing Electrical}
+Fixed_Housing$Electrical[is.na(Fixed_Housing$Electrical)] = Mode(Fixed_Housing$Electrical)
+```
+
+```{r Fixing MasVnrType/Area}
+temp = Fixed_Housing[which(Fixed_Housing$MasVnrType == "None"), ]
+ggplot(data = Fixed_Housing, aes(x = MasVnrType, y = MasVnrArea, fill = MasVnrType)) + geom_boxplot() 
+
+length(which(between(Fixed_Housing$MasVnrArea, 0.1, 10))) #Checking to see if any other MasVnrAreas are so low but not equal to 0. There is only 1 entry with a MasVnrArea between 0 and 11 (exclusive).
+
+
+Fixed_Housing$MasVnrType[which(is.na(Fixed_Housing$MasVnrType))] = "None"
+Fixed_Housing$MasVnrArea[which(is.na(Fixed_Housing$MasVnrArea))] = 0
+
+rm(temp)
+gc()
+```
+
+
+```{r Fixing GarageYrBlt}
+cor(Fixed_Housing$GarageYrBlt[!is.na(Fixed_Housing$GarageYrBlt)], Fixed_Housing$YearRemodAdd[!is.na(Fixed_Housing$GarageYrBlt)])
+Fixed_Housing$HasGarage = T
+Fixed_Housing$HasGarage[which(is.na(Fixed_Housing$GarageYrBlt))] = F
+
+
+Fixed_Housing$GarageYrBlt[which(is.na(Fixed_Housing$GarageYrBlt))] = Fixed_Housing$YearRemodAdd[which(is.na(Fixed_Housing$GarageYrBlt))]
+ 
+for (i in 1:length(rownames(Fixed_Housing))){
+  if(Fixed_Housing$GarageYrBlt[i] < Fixed_Housing$YearBuilt[i])
+    Fixed_Housing$GarageYrBlt[i] = Fixed_Housing$YearBuilt[i]
+} #Ensuring that the year a garage was built can't come before the year the house was built
+
+```
+
+```{r Fixing LotFrontage}
+temp = Fixed_Housing[!is.na(Fixed_Housing$LotFrontage),]
+for (i in 1:length(colnames(Fixed_Housing))){
+  plot(temp[!is.na(temp[,i]),i], temp$LotFrontage[!is.na(temp[,i])], xlab = colnames(temp)[i])
+}
+
+plot(log(temp$LotArea), temp$LotFrontage) #There are some outliers we should remove
+
+
+temp = Fixed_Housing[,c("MSSubClass", "LotArea", "LotShape", "Alley", "LandContour", "LotConfig", "Neighborhood", "BldgType", "OverallQual", "BsmtFinSF1", "TotalBsmtSF", "X1stFlrSF", "BedroomAbvGr", "TotRmsAbvGrd", "GarageArea", "LotFrontage")]
+
+
+
+levels(temp$Alley) = c(levels(temp$Alley),"N/A")
+temp$Alley[is.na(temp$Alley)] = "N/A"
+
+
+temp.predrows = temp[is.na(temp$LotFrontage), colnames(temp) != "LotFrontage"]
+temp = temp[!is.na(temp$LotFrontage),]
+temp$LotFrontage = as.numeric(temp$LotFrontage)
+
+temp = temp[!(temp$LotFrontage == max(temp$LotFrontage)),]
+
+temp = temp[!(temp$LotFrontage == max(temp$LotFrontage)),]
+
+temp = temp[!(temp$LotArea == max(temp$LotArea)),]
+
+
+
+###########################################################
+
+set.seed(1)
+train_control = trainControl(method = "repeatedcv", number = 10, repeats = 10) #Setting it so we will do K-Fold CV 10 times with K = 10. 
+
+
+temp.fit = train(log(LotFrontage)~. + log(LotArea), data = temp, method = "lm", trControl = train_control)
+resampleHist(temp.fit)
+
+temp.lassoFit = train(log(LotFrontage)~. + log(LotArea), data = temp, method = "glmnet", trControl= train_control, preProc = c("center","scale"), tuneGrid = expand.grid(alpha = 0, lambda = 10^seq(10, -2, length = 100)))
+resampleHist(temp.lassoFit)
+
+temp.ridgeFit = train(log(LotFrontage)~. + log(LotArea), data = temp, method = "glmnet", trControl= train_control, preProc = c("center","scale"), tuneGrid = expand.grid(alpha = 1, lambda = 10^seq(10, -2, length = 100)))
+resampleHist(temp.ridgeFit)
+
+print(temp.fit) #0.179133  0.7282393  0.1236229
+print(temp.lassoFit)
+print(temp.ridgeFit)
+
+###################
+temp.fit = lm(log(LotFrontage)~. + log(LotArea), data = temp)
+temp.preds = exp(predict(temp.fit, temp.predrows))
+
+####################
+Fixed_Housing$LotFrontage[which(is.na(Fixed_Housing$LotFrontage))] = unname(temp.preds)
+
+rm(temp)
+rm(temp.predrows)
+rm(temp.preds)
+gc()
+```
+
+
+
+
+
+```{r Fixing the other NAs}
+hasNa = apply(apply(Fixed_Housing, 2, is.na), 2, any); #First apply checks each entry for NA, then the next apply checks if the column has any True values. 
+
+hasNa.index = which(hasNa %in% TRUE); #Creating a list that contains the indices of the columns with NA's
+
+hasNa.names = names(Fixed_Housing[hasNa.index]); #Getting the names of the columns with NA entries.
+
+hasNa.columns = Fixed_Housing[,hasNa.index]; #Getting just the columns with na values
+hasNa.colSums = as.data.frame(t(colSums(is.na(Fixed_Housing[hasNa.index])))); #Looking at how many na's are present in each of the na filled columns.
+ 
+
+for (i in 1:length(colnames(hasNa.columns))){ #For loop to fix the remaining NA's by adding them as factors to their respective col's in Fixed_Housing
+  levels(Fixed_Housing[,colnames(hasNa.columns)[i]]) = c(levels(Fixed_Housing[,colnames(hasNa.columns)[i]]), "N/A")
+  Fixed_Housing[is.na(Fixed_Housing[,colnames(hasNa.columns)[i]]), colnames(hasNa.columns)[i]] = "N/A"
+}
+
+length(which(is.na(Fixed_Housing))) #Final check to see if all NA's are taken care of.
+
+rm(i)
+rm(hasNa)
+rm(hasNa.colSums)
+rm(hasNa.columns)
+rm(hasNa.index)
+rm(hasNa.names)
+gc()
+
+
+```
+
+
+
+
+```{r Fixing NAs in Test_Housing}
+hasNa = apply(apply(Test_Housing, 2, is.na), 2, any); #First apply checks each entry for NA, then the next apply checks if the column has any True values. 
+
+hasNa.index = which(hasNa %in% TRUE); #Creating a list that contains the indices of the columns with NA's
+
+hasNa.names = names(Test_Housing[hasNa.index]); #Getting the names of the columns with NA entries.
+
+hasNa.columns = Test_Housing[,hasNa.index]; #Getting just the columns with na values
+hasNa.colSums = as.data.frame(t(colSums(is.na(Test_Housing[hasNa.index])))); #Looking at how many na's are present in each of the na filled columns.
+
+par(mar=c(7, 4.1, 4.1, 2.1))
+barplot(as.matrix(hasNa.colSums), las = 2)
+
+######################################################
+
+#There is one row with NA data in the Garage-related columns but a non NA value for GarageType. So instead of setting them to 0 or NA, we'll leverage the Garage Type to fill it with better answers. 
+temp = Test_Housing[Test_Housing$GarageType == "Detchd",] #Getting only the data with Detchd GarageType
+temp = temp[-which(is.na(temp$GarageArea)),] #Removing the row that we'll be trying to fill in
+temp.row = which(is.na(Test_Housing$GarageArea)) #Getting the index of the row we're filling in with respect to Test_Housing
+temp = temp[!is.na(temp$GarageType),] #Dropping the rows that have an NA value in GarageType that got through the first check.
+
+Test_Housing$GarageArea[temp.row] = mean(temp$GarageArea)  #Since the garage area isn't discrete, we use mean
+Test_Housing$GarageCars[temp.row] = median(temp$GarageCars) #Since the garage cars is discrete, we use the median to avoid fractions of cars.
+
+temp[which(is.na(temp$GarageYrBlt)),] #Looking at the other row with missing Garage Qual, Cond, Finish, and YrBlt. We get that its index in Test_Housing is 667.
+temp = temp[-which(is.na(temp$GarageYrBlt)),]  #Dropping that row from the Temp data so we can use median/mode correctly.
+temp.row2 = 667 #Row is derived from looking at 
+
+Test_Housing$HasGarage = T
+
+Test_Housing$HasGarage[temp.row] = F
+Test_Housing$GarageYrBlt[temp.row] = Test_Housing$YearRemodAdd[temp.row] #We replace the NA GarageYrBlt for this row with the median of GarageYrBlt for Detchd types
+Test_Housing$GarageCond[temp.row] = Mode(temp$GarageCond)
+Test_Housing$GarageFinish[temp.row] = Mode(temp$GarageFinish)
+Test_Housing$GarageQual[temp.row] = Mode(temp$GarageQual)
+
+
+Test_Housing$HasGarage[temp.row2] = F
+Test_Housing$GarageYrBlt[temp.row2] = Test_Housing$YearRemodAdd[temp.row2] #We replace the NA GarageYrBlt for this row with the median of GarageYrBlt for Detchd types
+Test_Housing$GarageCond[temp.row2] = Mode(temp$GarageCond)
+Test_Housing$GarageFinish[temp.row2] = Mode(temp$GarageFinish)
+Test_Housing$GarageQual[temp.row2] = Mode(temp$GarageQual)
+
+rm(temp)
+rm(temp.row)
+rm(temp.row2)
+
+Test_Housing$HasGarage[is.na(Test_Housing$GarageYrBlt)] = F
+Test_Housing$GarageYrBlt[is.na(Test_Housing$GarageYrBlt)] = Test_Housing$YearRemodAdd[!is.na(Test_Housing$GarageYrBlt)] #Fixing the general NA GarageYrBlt by simply setting them to YearRemodAdd
+
+for (i in 1:length(rownames(Test_Housing))){
+  if(Test_Housing$GarageYrBlt[i] < Test_Housing$YearBuilt[i])
+    Test_Housing$GarageYrBlt[i] = Test_Housing$YearBuilt[i]
+} #Ensuring that the year a garage was built can't come before the year the house was built
+
+######################################################
+
+Test_Housing$SaleType[is.na(Test_Housing$SaleType)] = Mode(Test_Housing$SaleType[!is.na(Test_Housing$SaleType)]) #Since it's only one NA, we're simply setting the SaleType NA to be the Mode of SaleType.
+
+########################################################
+
+Test_Housing$Functional[is.na(Test_Housing$Functional)] = "Typ" #Setting the NA Functional values to be "Typ" since the data description says to assume Typ unless certain criteria are met, which we can't really deduce 
+
+#########################################################
+
+Test_Housing$KitchenQual = "TA" #The kitchen is most likely typical/average so we simply set the 1 NA value to TA.
+
+########################################################
+
+Test_Housing$BsmtFullBath[is.na(Test_Housing$BsmtFullBath)] = 0 #Looking at the rows with NA BsmtFullBath, we see that they don't have basements, so the number of FullBaths in the BSMT is 0.
+Test_Housing$BsmtHalfBath[is.na(Test_Housing$BsmtHalfBath)] = 0 #Same as for Full Bath.
+
+########################################################
+
+Test_Housing[is.na(Test_Housing$BsmtFinSF2), c("BsmtFinSF1", "BsmtFinSF2", "BsmtUnfSF", "TotalBsmtSF")] = 0 #One row has NA in these numeric values for the basement, so we're setting them to 0, since that particular house is missing a basement entirely.
+
+###########################################################
+
+Test_Housing$Exterior1st[is.na(Test_Housing$Exterior1st)] = Mode(Test_Housing$Exterior1st) #Since there's only one house that has an NA Exterior1st or 2nd, we simply set it equal to the Mode.
+Test_Housing$Exterior2nd[is.na(Test_Housing$Exterior2nd)] = Mode(Test_Housing$Exterior2nd)
+
+###########################################################
+
+counts = table(Test_Housing$MSZoning, Test_Housing$Neighborhood)
+barplot(counts, main="Zoning & Neighborhood", xlab="Neighborhood", col=c("darkblue","red", "green", "orange", "yellow"), legend = rownames(counts))
+#We can see that the Neighborhood explains a lot of the MSZoning, so we'll use just that to fill in MSZoning.
+
+#Setting the NAs of MSZoning to be the Mode of the MSZoning's matching their respective neighborhoods.
+temp = Test_Housing$Neighborhood[is.na(Test_Housing$MSZoning)]
+temp2 = which(is.na(Test_Housing$MSZoning)) 
+for (i in 1:length(temp)){
+  Test_Housing$MSZoning[temp2[i]] = Mode(Test_Housing$MSZoning[Test_Housing$Neighborhood == temp[i]])
+}
+
+rm(temp)
+rm(temp2)
+rm(counts)
+###########################################################
+
+Test_Housing$Utilities[is.na(Test_Housing$Utilities)] = Mode(Test_Housing$Utilities) #Simply setting the NA utilities to the Mode of Utilities, which is AllPub. On this data set, every house had AllPub so there's not much analysis to do beyond that.
+
+############################################################
+
+#Just as before, we set the NA MasVnrType's to "None" and the area to 0 if it was NA. It will result in one house having "None" MasVnrType and a non-zero area, but this case is possible and only affects one of the houses.
+Test_Housing$MasVnrType[is.na(Test_Housing$MasVnrType)] = "None"
+Test_Housing$MasVnrArea[is.na(Test_Housing$MasVnrArea)] = 0
+
+
+#############################################################
+
+#There are several basement descriptors with differing amount of NAs so they need a closer inspection. 
+#First, we'll look at BsmtExposure since it has the most NAs of the Bsmt variables. 
+temp = Test_Housing[is.na(Test_Housing$BsmtExposure), c("BsmtQual", "BsmtCond", "BsmtExposure", "BsmtFinType1", "BsmtFinType2")] 
+Test_Housing$BsmtExposure[c(28,889)] = "No" #Looking at the rows with none NA values, in the other basement variables, we can see that row 28 and 889 correspond to houses that probably do have basements but no exposure. In this case, we set the Exposure to "No" instead of NA. 
+
+#Now, we fixed Exposure, but BsmtQual and BsmtCond are differing from the other variables so we do the same to them.
+
+temp = Test_Housing[is.na(Test_Housing$BsmtCond), c("BsmtQual", "BsmtCond", "BsmtExposure", "BsmtFinType1", "BsmtFinType2")] 
+Test_Housing$BsmtCond[c(581, 726, 1065)] = "TA" #Looking at several individual predictors for BsmtCond, they all are overwhelmingly TA which is expected so we just set these 3 values to TA.
+
+
+#Finally, we look at BsmtQual
+temp = Test_Housing[is.na(Test_Housing$BsmtQual), c("BsmtQual", "BsmtCond", "BsmtExposure", "BsmtFinType1", "BsmtFinType2")] 
+Test_Housing$BsmtQual[c(758, 759)] = "TA" #These two houses have none NA values in the other basement columns so it most likely has one. As a result, we just set the Qual to be typical/average.
+
+#############################################################
+
+
+temp = Test_Housing[,c("MSSubClass", "LotArea", "LotShape", "Alley", "LandContour", "LotConfig", "Neighborhood", "BldgType", "OverallQual", "BsmtFinSF1", "TotalBsmtSF", "X1stFlrSF", "BedroomAbvGr", "TotRmsAbvGrd", "GarageArea", "LotFrontage")]
+
+attach(temp)
+temp$Alley = as.factor(Alley)
+levels(temp$Alley) = c(levels(temp$Alley),"N/A")
+temp$Alley[is.na(temp$Alley)] = "N/A"
+
+
+
+temp$Neighborhood = as.factor(Neighborhood)
+temp$LotShape = as.factor(LotShape)
+temp$LotConfig = as.factor(LotConfig)
+temp$BldgType = as.factor(BldgType)
+temp$LandContour = as.factor(LandContour)
+detach(temp)
+
+
+temp.predrows = temp[is.na(temp$LotFrontage), !(colnames(temp) %in% "LotFrontage")]
+temp.preds = predict(temp.fit, temp.predrows)
+Test_Housing$LotFrontage[which(is.na(Test_Housing$LotFrontage))] = unname(temp.preds)
+
+
+######################################################
+
+#Now, we fix the remaining NA's by adding "N/A" as a string that we'll turn into a factor later.
+
+hasNa = apply(apply(Test_Housing, 2, is.na), 2, any); #First apply checks each entry for NA, then the next apply checks if the column has any True values. 
+
+hasNa.index = which(hasNa %in% TRUE); #Creating a list that contains the indices of the columns with NA's
+
+hasNa.names = names(Test_Housing[hasNa.index]); #Getting the names of the columns with NA entries.
+
+hasNa.columns = Test_Housing[,hasNa.index]; #Getting just the columns with na values
+hasNa.colSums = as.data.frame(t(colSums(is.na(Test_Housing[hasNa.index])))); #Looking at how many na's are present in each of the na filled columns.
+
+
+for (i in 1:length(colnames(hasNa.columns))){ #For loop to fix the remaining NA's by adding them as factors to their respective col's in Fixed_Housing
+  Test_Housing[is.na(Test_Housing[,colnames(hasNa.columns)[i]]), colnames(hasNa.columns)[i]] = "N/A" #addNA(Test_Housing[, colnames(hasNa.columns)[i]])
+}
+
+length(which(is.na(Test_Housing))) #Final check to see if all NA's are taken care of.
+
+rm(i)
+rm(hasNa)
+rm(hasNa.colSums)
+rm(hasNa.columns)
+rm(hasNa.index)
+rm(hasNa.names)
+gc()
+
+#Finally, making it so all chr data types become factors
+Test_Housing = as.data.frame(unclass(Test_Housing), stringsAsFactors = TRUE)
+```
+
+
+
+
+```{r Understanding the Data}
+
+#######################################################################################################################
+#Looking at correlations
+
+fh.corr = abs(round(cor(Fixed_Housing[, num_cols]), 1)) #Shows the correlation between all the numeric variables.
+
+corrVars = corrAbove(fh.corr, 0.7) #Returns a data frame that lists the row/col pairs of highly correlated variables past a threshold. Excludes duplicates
+corrVars[,1] = names(num_cols[corrVars[,1]]) #Both these lines simply are changing the number pairs to their actual names.
+corrVars[,2] = names(num_cols[corrVars[,2]])
+
+fh.lowCorr = fh.corr["SalePrice", fh.corr["SalePrice",] <= 0.1] #Returns the columns with low correlation to SalePrice as a named list.
+
+
+#If the correlation is low, uses ANOVA to see if it's possible the numeric data is acting more like a factor. If it passes using ANOVA, then we will keep it in the model. It is possible that this might result in some unnecessary variables remaining when they should not, but this is preferred over dropping variables that do have high correlation with SalePrice.
+
+for(i in 1:length(fh.lowCorr)){ 
+  temp = aov(SalePrice ~ eval(parse(text = names(fh.lowCorr[i]))), Fixed_Housing)
+  temp = summary(temp)[[1]][["Pr(>F)"]][1]
+  if(temp < 0.05)
+    fh.lowCorr[names(fh.lowCorr[i])] = 1
+}
+
+
+apply(corrVars, 2, function(x) any(x %in% names(fh.lowCorr))) #Just checking if any of the columns with low correlation to SalePrice are in the generally highly correlated variables data frame.
+
+
+
+temp = apply(corrVars[,c(1,2)], 1, pickDroppedCorr, corrMat = fh.corr) #Using pickDroppedCorr to help figure out which columns to drop. This might not be the best approach though.
+
+corrVars.names = temp[!is.na(temp)] #Only getting the names and dropping the possible NAs stored in temp
+
+ggcorrplot(fh.corr, lab = T, type = "upper") #Plotting the correlations vs each other
+
+fh.corr2 = fh.corr[!(colnames(fh.corr) %in% names(fh.lowCorr)), !(colnames(fh.corr) %in% names(fh.lowCorr))] #Removing the dropped columns of LowDimHousing from the correlation matrix to make it easier to read
+
+ggcorrplot(fh.corr2, lab = T, type = "upper") #Plotting the correlations vs each other
+
+
+
+#Performing ANOVA on each of the Factors now to see if they're related to SalePrice. 
+fh.factors = cbind(Fixed_Housing[,-num_cols], Fixed_Housing[, "SalePrice"])
+fh.AOVstats = rep(-1, length(colnames(fh.factors))-1)
+for(i in 1:(length(names(fh.factors)) -1)){
+  temp = aov(SalePrice ~ eval(parse(text = colnames(fh.factors)[i])), Fixed_Housing)
+  temp = summary(temp)[[1]][["Pr(>F)"]][1]
+  fh.AOVstats[i] = temp
+}
+
+fh.badAOV = colnames(fh.factors[, which(fh.AOVstats > 0.01)]) #Extracting just the names of the columns to drop.
+
+
+sum(sapply((sapply(Fixed_Housing[,-num_cols], levels)), length)) #Returns the count of unique factor levels in Fixed_Housing
+
+rm(temp)
+
+
+```
+
+```{r Troubleshooting for Random Forest}
+Fixed_Housing.levels = sapply(Fixed_Housing[,-num_cols], levels)
+Test_Housing.levels = sapply(Test_Housing[,-num_cols[-length(num_cols)]], levels) #Needs the -length(num_cols) so it doesn't drop the last column.
+fhLevelsMissingInTH = rep(F, length(Test_Housing.levels))
+thLevelsMissingInFH = rep(F, length(Test_Housing.levels))
+missingLevels = rep(NA, length(Test_Housing.levels))
+ 
+for (i in 1:length(Test_Housing.levels)){
+  if(any(!(unlist(Fixed_Housing.levels[i]) %in% unlist(Test_Housing.levels[i]))))
+    fhLevelsMissingInTH[i] = T
+  if(any(!(unlist(Test_Housing.levels[i]) %in% unlist(Fixed_Housing.levels[i]))))
+    thLevelsMissingInFH[i] = T
+}
+
+temp = names(Fixed_Housing.levels[which(fhLevelsMissingInTH)])
+
+for(i in 1:length(which(fhLevelsMissingInTH))){
+  levels(Test_Housing[,temp[i]]) = levels(Fixed_Housing[,temp[i]])
+}
+
+
+```
+
+```{r Regression}
+require(methods)
+set.seed(1)
+x = Fixed_Housing[,-which(colnames(Fixed_Housing) %in% "SalePrice")]
+x = data.matrix(x, colnames(x))
+cv_model = cv.glmnet(x, Fixed_Housing[,"SalePrice"], alpha = 1)
+best_lambda = cv_model$lambda.min
+ 
+newx = data.matrix(Test_Housing)
+best_model = glmnet(x, Fixed_Housing[,"SalePrice"], alpha = 1, lambda = best_lambda)
+lasso.finalTestPred = predict(best_model, s = best_lambda, newx = newx)
+
+lasso.ansDF = as.data.frame(cbind(c(1461:2919), lasso.finalTestPred))
+colnames(lasso.ansDF) = c("Id", "SalePrice")
+write.csv(lasso.ansDF, file="lassoWithAllVars.csv", row.names = F) #Gets 0.20032 from Kaggle
+#############################################################################################################
+
+set.seed(1)
+lm.finalFit = lm(log(SalePrice)~., data = Fixed_Housing)
+lm.finalTestPred = exp(predict(lm.finalFit, Test_Housing))
+lm.ansDF = as.data.frame(cbind(c(1461:2919), lm.finalTestPred))
+colnames(lm.ansDF) = c("Id", "SalePrice") #Gives answers that are way too small.
+
+##########################################################################
+set.seed(1)
+rf.fit = randomForest(SalePrice ~ ., data = Fixed_Housing, mtry = 3, importance = TRUE)
+print(rf.fit)
+plot(rf.fit)
+rf.Importance = importance(rf.fit)
+
+rf.finalTestPred = predict(rf.fit, Test_Housing)
+rf.ansDF = as.data.frame(cbind(c(1461:2919), rf.finalTestPred))
+colnames(rf.ansDF) = c("Id", "SalePrice")
+
+write.csv(rf.ansDF, file="rfWithAllVars.csv", row.names = F) #0.18692
+
+
+
+
+##########################################################################################################
+#Using the log of SalePrice instead of directly using SalePrice
+
+
+set.seed(1)
+x = Fixed_Housing[,-which(colnames(Fixed_Housing) %in% "SalePrice")]
+x = data.matrix(x, colnames(x))
+logcv_model = cv.glmnet(x, log(Fixed_Housing[,"SalePrice"]), alpha = 1)
+
+best_lambda = logcv_model$lambda.min
+newx = data.matrix(Test_Housing)
+best_model = glmnet(x, log(Fixed_Housing[,"SalePrice"]), alpha = 1, lambda = best_lambda)
+logLasso.finalTestPred = exp(predict(best_model, s = best_lambda, newx = newx))
+
+logLasso.ansDF = as.data.frame(cbind(c(1461:2919), logLasso.finalTestPred))
+colnames(logLasso.ansDF) = c("Id", "SalePrice")
+write.csv(logLasso.ansDF, file="logLassoWithAllVars.csv", row.names = F) #Gets 0.14763 from Kaggle
+
+############################
+
+set.seed(1)
+logrf.fit = randomForest(log(SalePrice) ~ ., data = Fixed_Housing, mtry = 3, importance = TRUE)
+logrf.Importance = importance(logrf.fit)
+
+logrf.finalTestPred = exp(predict(logrf.fit, Test_Housing))
+logrf.ansDF = as.data.frame(cbind(c(1461:2919), logrf.finalTestPred))
+colnames(logrf.ansDF) = c("Id", "SalePrice")
+
+write.csv(logrf.ansDF, file="logrfWithAllVars.csv", row.names = F) #0.17134
+
+
+
+#####################################################################################################
+logLasso.predsUsed = as.matrix(best_model$beta)
+logLasso.predsUsed = rownames(logLasso.predsUsed)[logLasso.predsUsed  != 0]
+LassoPreds_Housing = Fixed_Housing[, c(logLasso.predsUsed, "SalePrice")]
+
+
+set.seed(1)
+logrf.fitLP = randomForest(log(SalePrice) ~ ., data = LassoPreds_Housing, mtry = 3, importance = TRUE) 
+logrf.finalTestPredLP = exp(predict(logrf.fitLP, Test_Housing[, colnames(Test_Housing)%in% colnames(LassoPreds_Housing)]))
+
+logrf.ImportanceLP = importance(logrf.fitLP)
+logrf.ansDFLP = as.data.frame(cbind(c(1461:2919), logrf.finalTestPredLP))
+colnames(logrf.ansDFLP) = c("Id", "SalePrice")
+
+write.csv(logrf.ansDFLP, file="logrfWithLogLassoPreds.csv", row.names = F) #0.15574
+
+
+
+#################################################################################################
+cv.ridge = cv.glmnet(x, log(Fixed_Housing$SalePrice), alpha = 0)
+best_lambda = cv.ridge$lambda.min
+
+ridge.fit = glmnet(x, log(Fixed_Housing$SalePrice), alpha = 0, lambda = best_lambda)
+
+ridge.finalTestPred = exp(predict(ridge.fit, s = best_lambda, newx = newx))
+
+ridge.ansDF = as.data.frame(cbind(c(1461:2919), ridge.finalTestPred))
+colnames(ridge.ansDF) = c("Id", "SalePrice")
+write.csv(ridge.ansDF, file="logRidgeWithAllVars.csv", row.names = F) #0.16215 
+
+######################################################################
+
+
+
+
+makeHist(Fixed_Housing$SalePrice, "Training Prices")
+
+makeHist(lm.finalTestPred, "Linear Regression w/ Log", ymax = 1500, xmax = 100000)
+
+makeHist(rf.finalTestPred, "Random Forest Predictions (No Log)", 0.20720) #0.20720 
+makeHist(logrf.finalTestPred, "Random Forest Predictions w/ Log", 0.19459) #0.19459
+makeHist(logrf.finalTestPredLP, "Random Forest Predictions w/ Log and Reduced Dimensionality", 0.17611) #0.17611
+
+
+
+makeHist(lasso.finalTestPred, "Lasso Predictions (No Log)", 0.18528) #0.18528
+makeHist(logLasso.finalTestPred, "Lasso Predictions w/ Log", 0.14522) #0.14522
+makeHist(ridge.finalTestPred, "Ridge Predictions w/ Log", 0.14875) #0.14875
+
+
+
+makeLogHist(Fixed_Housing$SalePrice, "Training Prices")
+
+makeLogHist(rf.finalTestPred, "Random Forest Predictions (No Log)", 0.20720)
+makeLogHist(logrf.finalTestPred, "Random Forest Predictions w/ Log", 0.19459)
+makeLogHist(logrf.finalTestPredLP, "Random Forest Predictions w/ Log and Reduced Dimensionality", 0.17611)
+
+makeLogHist(lasso.finalTestPred, "Lasso Predictions (No Log)", 0.18528)
+makeLogHist(logLasso.finalTestPred, "Lasso Predictions w/ Log", 0.14522)
+makeLogHist(ridge.finalTestPred, "Ridge Predictions w/ Log", 0.14875)
+```
+
+```{r Data With Outliers Removed}
+plot(Fixed_Housing$LotFrontage)
+plot(Fixed_Housing$LotArea)
+plot(Fixed_Housing$MasVnrArea)
+plot(Fixed_Housing$BsmtFinSF1)
+plot(Fixed_Housing$TotalBsmtSF)
+plot(Fixed_Housing$X1stFlrSF)
+plot(Fixed_Housing$GrLivArea)
+plot(Fixed_Housing$EnclosedPorch)
+plot(Fixed_Housing$MiscVal)
+
+outliers_rows = c(order(Fixed_Housing$LotFrontage, decreasing=TRUE)[1:2], order(Fixed_Housing$LotArea, decreasing=TRUE)[1:4], order(Fixed_Housing$MasVnrArea, decreasing=TRUE)[1:2],order(Fixed_Housing$BsmtFinSF1, decreasing=TRUE)[1], order(Fixed_Housing$TotalBsmtSF, decreasing=TRUE)[1:5], order(Fixed_Housing$X1stFlrSF, decreasing=TRUE)[1], order(Fixed_Housing$GrLivArea, decreasing=TRUE)[1:4], order(Fixed_Housing$EnclosedPorch, decreasing=TRUE)[1:2], order(Fixed_Housing$MiscVal, decreasing=TRUE)[1:2])
+
+outliers_rows = unique(outliers_rows)
+Fixed_Housing = Fixed_Housing[-outliers_rows,]
+
+
+dropCols = c("Street", "Alley", "LandContour", "Utilities", "LandSlope", "Condition2", "RoofMatl", "BsmtFinType2", "Heating", "Electrical", "Functional", "GarageCond", "PavedDrive", "PoolQC")
+
+my_aovs = rep(NA, length(dropCols))
+for(i in 1:length(dropCols)){
+  temp = aov(SalePrice~ eval(parse(text = dropCols[i])), Fixed_Housing)
+  my_aovs[i] = summary(temp)[[1]][["Pr(>F)"]][1]
+  if(my_aovs[i] > 0.001){
+    my_aovs[i] = T
+  }
+  else
+    my_aovs[i] = F
+}
+dropCols = c(dropCols[as.logical(my_aovs)], "KitchenAbvGr")
+Fixed_Housing = Fixed_Housing[, !(colnames(Fixed_Housing) %in% dropCols)]
+
+###############################################################
+set.seed(1)
+x = Fixed_Housing[,-which(colnames(Fixed_Housing) %in% "SalePrice")]
+x = data.matrix(x, colnames(x))
+logcv_model = cv.glmnet(x, log(Fixed_Housing[,"SalePrice"]), alpha = 1)
+
+best_lambda = logcv_model$lambda.min
+newx = data.matrix(Test_Housing[,colnames(Test_Housing) %in% colnames(Fixed_Housing)])
+best_model = glmnet(x, log(Fixed_Housing[,"SalePrice"]), alpha = 1, lambda = best_lambda)
+logLasso.finalTestPredOut = exp(predict(best_model, s = best_lambda, newx = newx))
+
+logLasso.ansDFOut = as.data.frame(cbind(c(1461:2919), logLasso.finalTestPredOut))
+colnames(logLasso.ansDFOut) = c("Id", "SalePrice")
+write.csv(logLasso.ansDFOut, file="logLassoWithAllVarsOutliersRemoved.csv", row.names = F) #Gets 0.13871 from Kaggle
+makeHist(logLasso.finalTestPredOut, "Log Lasso with Outliers Removed", 0.13871, 800000, 1000)
+
+############################################################
+
+set.seed(1)
+x = Fixed_Housing[,-which(colnames(Fixed_Housing) %in% "SalePrice")]
+x = as.matrix(fastDummies::dummy_cols(x, remove_first_dummy = TRUE, remove_selected_columns = TRUE))
+
+logcv_model = cv.glmnet(x, log(as.matrix(Fixed_Housing[,"SalePrice"])) , alpha = 1)
+
+best_lambda = logcv_model$lambda.min
+newx = as.matrix(fastDummies::dummy_cols(Test_Housing[,colnames(Test_Housing) %in% colnames(Fixed_Housing)], remove_first_dummy = TRUE, remove_selected_columns = TRUE))
+
+best_model.fact = glmnet(x, log(Fixed_Housing[,"SalePrice"]), alpha = 1, lambda = best_lambda)
+logLasso.finalTestPredOutFact = exp(predict(best_model.fact, s = best_lambda, newx = newx))
+
+logLasso.ansDFOutFact = as.data.frame(cbind(c(1461:2919), logLasso.finalTestPredOutFact))
+colnames(logLasso.ansDFOutFact) = c("Id", "SalePrice")
+write.csv(logLasso.ansDFOutFact, file="logLassoWithAllVarsOutliersRemovedFactors.csv", row.names = F) 
+makeHist(logLasso.finalTestPredOutFact, "Log Lasso with Outliers Removed w/ Factors", 0.13783, 800000, 1000)
+
+plot(logLasso.ansDFOutFact)
+
+#############################################################################
+logLasso.predsUsedOut = as.matrix(best_model$beta)
+logLasso.predsUsedOut = logLasso.predsUsedOut[logLasso.predsUsedOut  != 0,]
+logLasso.predsUsedOutNames = names(logLasso.predsUsedOut)
+LassoPreds_Housing2 = Fixed_Housing[, c(logLasso.predsUsedOutNames, "SalePrice")]
+
+
+set.seed(1)
+logrf.fitLP2 = randomForest(log(SalePrice) ~ ., data = LassoPreds_Housing2, mtry = 3, importance = TRUE) 
+logrf.finalTestPredLP2 = exp(predict(logrf.fitLP2, Test_Housing[, colnames(Test_Housing)%in% colnames(LassoPreds_Housing2)]))
+
+logrf.ImportanceLP2 = importance(logrf.fitLP2)
+logrf.ansDFLP2 = as.data.frame(cbind(c(1461:2919), logrf.finalTestPredLP2))
+colnames(logrf.ansDFLP2) = c("Id", "SalePrice") 
+
+write.csv(logrf.ansDFLP2, file="logrfWithLogLassoPreds2.csv", row.names = F) #0.17855
+makeHist(logrf.finalTestPredLP2, "Random Forest w/ Log Predictor and Reduced Cols (Manual and Lasso)", 0.17855)
+
+```
+
+
+
+
+```{r Final Thoughts}
+treeImportance = importance(logrf.fitLP)
+
+logLasso.predsUsedOutFact = rbind(best_model.fact$a0, as.matrix(best_model.fact$beta))
+
+logLasso.predsUsedOutFact = logLasso.predsUsedOutFact[logLasso.predsUsedOutFact  != 0,]
+logLasso.predsUsedOutFactNames = names(sort(logLasso.predsUsedOutFact, decreasing = T))
+temp = logLasso.predsUsedOutFactNames %in% colnames(Fixed_Housing)
+temp2 = sort(logLasso.predsUsedOutFact, decreasing = T)[temp]
+
+
+#################################################################
+
+logLasso.predsUsedOut = rbind(best_model$a0, as.matrix(best_model$beta))
+logLasso.predsUsedOut = logLasso.predsUsedOut[logLasso.predsUsedOut  != 0,]
+logLasso.predsUsedOutNames = names(logLasso.predsUsedOut) #sort(logLasso.predsUsedOut, decreasing = T))
+
+
+makeHist(Fixed_Housing$SalePrice, "Training Prices")
+
+makeHist(rf.finalTestPred, "Random Forest Predictions (No Log)", 0.20720)  
+makeHist(logrf.finalTestPred, "Random Forest Predictions w/ Log", 0.19459) 
+makeHist(logrf.finalTestPredLP, "Random Forest Predictions w/ Log and Reduced Dimensionality", 0.17611) 
+makeHist(logrf.finalTestPredLP2, "Random Forest w/ Log Predictor and Reduced Cols (Manual and Lasso)", 0.17855) 
+
+
+makeHist(lasso.finalTestPred, "Lasso Predictions (No Log)", 0.18528) 
+makeHist(logLasso.finalTestPred, "Lasso Predictions w/ Log", 0.14522) 
+makeHist(ridge.finalTestPred, "Ridge Predictions w/ Log", 0.14875) 
+ 
+makeHist(logLasso.finalTestPredOut, "Log Lasso with Outliers Removed", 0.13871, 800000, 1000)
+makeHist(logLasso.finalTestPredOutFact, "Log Lasso with Outliers Removed w/ Factors", 0.13783, 800000, 1000)
+
+
+
+
+```
+
+```{r Log Preds As New Column}
+
+set.seed(1)
+x = Fixed_Housing[,-which(colnames(Fixed_Housing) %in% "SalePrice")]
+x = cbind(x, log(x$X1stFlrSF), log(x$OverallQual), log(x$GrLivArea))
+x = data.matrix(x, colnames(x))
+logcv_model = cv.glmnet(x, log(Fixed_Housing[,"SalePrice"]), alpha = 1)
+
+best_lambda = logcv_model$lambda.min
+newx = Test_Housing[,colnames(Test_Housing) %in% colnames(Fixed_Housing)]
+newx = cbind(newx, log(newx$X1stFlrSF), log(newx$OverallQual), log(newx$GrLivArea))
+newx = data.matrix(newx)
+
+best_model.logPred = glmnet(x, log(Fixed_Housing[,"SalePrice"]), alpha = 1, lambda = best_lambda)
+logLasso.finalTestPredOutLogPred = exp(predict(best_model.logPred, s = best_lambda, newx = newx))
+
+logLasso.ansDFOutLogPred = as.data.frame(cbind(c(1461:2919), logLasso.finalTestPredOutLogPred))
+colnames(logLasso.ansDFOutLogPred) = c("Id", "SalePrice")
+write.csv(logLasso.ansDFOutLogPred, file="logLassoWithAllVarsOutliersRemovedLogPreds.csv", row.names = F)
+makeHist(logLasso.finalTestPredOutLogPred, "Log Lasso with Outliers Removed And Some Log Preds", 0.13192, 800000, 1000)
+
+plot(logLasso.finalTestPredOutLogPred)
+
+
+logLasso.predsUsedOutLogPred = rbind(best_model.logPred$a0, as.matrix(best_model.logPred$beta))
+logLasso.nonZeroPredsUsedOutLogPred = logLasso.predsUsedOutLogPred[logLasso.predsUsedOutLogPred  != 0,]
+logLasso.nonZerogammasUsedOutLogPred = exp(logLasso.nonZeroPredsUsedOutLogPred)
+#view(round(logLasso.nonZerogammasUsedOutLogPred,4))
+
+
+logLasso.fullGammasLogPred = exp(t(logLasso.predsUsedOutLogPred))
+
+Test_Housing2 = cbind(Test_Housing[colnames(Test_Housing)%in% colnames(logLasso.fullGammasLogPred)], log(Test_Housing$X1stFlrSF), log(Test_Housing$OverallQual), log(Test_Housing$GrLivArea))
+Test_Housing2 = data.matrix(Test_Housing2)
+
+logLasso.componentsLogPred = as.data.frame(rep(logLasso.fullGammasLogPred[,1], 1459))
+
+for(i in 2:length(logLasso.fullGammasLogPred)){
+  logLasso.componentsLogPred = cbind(as.data.frame(logLasso.componentsLogPred), as.data.frame(logLasso.fullGammasLogPred[,i]^Test_Housing2[,(i-1)]))
+#logLasso.componentsLogPred = cbind(as.data.frame(logLasso.fullGammasLogPred[,-1]^data.matrix(Test_Housing2)))
+}
+
+colnames(logLasso.componentsLogPred) = c("Intercept", colnames(Test_Housing2))
+
+logLasso.meanComponentsLogPred = apply(logLasso.componentsLogPred, 2, mean)
+
+best_model.logPred$dev.ratio
+
+length(which(logLasso.predsUsedOutLogPred!=0))
+product(logLasso.meanComponentsLogPred)
+mean(logLasso.finalTestPredOutLogPred)
+
+length(which(logLasso.meanComponentsLogPred[-1] > 1))
+length(which(logLasso.meanComponentsLogPred[-1] < 1))
+length(which(logLasso.meanComponentsLogPred[-1] == 1))
+colsNotUsed = colnames(Housing)
+
+########################################################################################
+
+set.seed(1)
+x = Fixed_Housing[,-which(colnames(Fixed_Housing) %in% "SalePrice")]
+x = cbind(x, log(x$X1stFlrSF), log(x$OverallQual), log(x$GrLivArea))
+x = as.matrix(fastDummies::dummy_cols(x, remove_first_dummy = TRUE, remove_selected_columns = TRUE))
+
+logcv_model = cv.glmnet(x, log(as.matrix(Fixed_Housing[,"SalePrice"])) , alpha = 1)
+
+best_lambda = logcv_model$lambda.min
+newx = as.matrix(fastDummies::dummy_cols(cbind(Test_Housing[,colnames(Test_Housing) %in% colnames(Fixed_Housing)], log(Test_Housing$X1stFlrSF), log(Test_Housing$OverallQual), log(Test_Housing$GrLivArea)), remove_first_dummy = TRUE, remove_selected_columns = TRUE))
+
+best_model.factLogPreds = glmnet(x, log(Fixed_Housing[,"SalePrice"]), alpha = 1, lambda = best_lambda)
+logLasso.finalTestPredOutFactLogPreds = exp(predict(best_model.factLogPreds, s = best_lambda, newx = newx))
+
+logLasso.ansDFOutFactLogPreds = as.data.frame(cbind(c(1461:2919), logLasso.finalTestPredOutFactLogPreds))
+colnames(logLasso.ansDFOutFactLogPreds) = c("Id", "SalePrice")
+write.csv(logLasso.ansDFOutFactLogPreds, file="logLassoWithAllVarsOutliersRemovedFactorsLogPreds.csv", row.names = F) 
+makeHist(logLasso.finalTestPredOutFactLogPreds, "Log Lasso with Outliers Removed w/ Factors and Log Preds", 0.13230, 800000, 1000) #Worse than just log lasso without preds.
+ 
+plot(logLasso.ansDFOutFactLogPreds)
+```
